@@ -74,6 +74,40 @@ master 挂了不自动选主;运维手动把某 slave 提升为 master 并切换
 ### Decision 9 — 读写分离:本版不做
 读请求一律走 master。读写分离会引入 slave 落后的陈旧读与最终一致性复杂度,本学习版先聚焦把复制本身做正确,该特性明确移出范围。
 
+## 模块划分(Modules)
+
+### Module 1: `lru.py` — LRUCache
+- 职责: O(1) LRU 存储 + TTL;主/单机用 authoritative,从用 logical。
+- 接口: `get(key, now)`、`set(key, value, expire_at)`(返回被淘汰 key)、`apply_set(...)`(非淘汰回放)、`delete(key)`、`set_expire(key, expire_at)`、`sample_expired(now)`、`snapshot()`、`load_snapshot(items)`。
+
+### Module 2: `protocol.py` — 协议编解码
+- 职责: RESP 响应编码、RESP array 请求编码、双模式增量解析与分帧。
+- 接口: `encode_simple/encode_error/encode_bulk/encode_command`、`Parser.feed/parse_one`、`decode_resp_array`。
+
+### Module 3: `hashring.py` — ConsistentHashRing
+- 职责: 带虚拟节点的一致性哈希环。
+- 接口: `add_node(node)`、`remove_node(node)`、`get_node(key)`、`nodes`。
+
+### Module 4: `client.py` — DistributedCacheClient
+- 职责: 客户端侧一致性哈希路由 + 阻塞 socket 收发。
+- 接口: `set/get/delete(key[, value])`、`route(key)`、`add_node/remove_node(host, port)`、`close()`。
+
+### Module 5: `replication.py` — 复制
+- 职责: master 推送 effect batch;slave 全量同步 + 原子回放。
+- 接口: `MasterReplicator.append_batch(effects)`(同步、无 await)、`MasterReplicator.handle_replica(reader, writer)`;`ReplicaClient.start/stop/run`、`applied_offset`、`synced_event`;`effect_to_payload/payload_to_effect`。
+
+### Module 6: `server.py` — Node
+- 职责: asyncio TCP 节点,串起存储/协议/复制;master 接受写,slave 只读;手动切换。
+- 接口: `start()`、`stop()`、`follow(host, port)`、`promote()`、内部 `_dispatch(args)`。
+
+## 数据模型(Data Model)
+
+- `_Node`(LRU 链表节点): `key`、`value`、`expire_at`(绝对秒,或 None)、`prev`、`next`。
+- `LRUCache`: `_map: dict[key -> _Node]` + 双向链表(哨兵 `head`/`tail`,`head.next` 为 MRU,`tail.prev` 为 LRU)。
+- `effect`(复制效果,元组): `("SET", key, value, pexpireat_ms)` / `("DEL", key)` / `("PEXPIREAT", key, ms)`;`ms=0` 表示无过期。
+- `Batch`: `offset`(单调递增) + `effects: list`。
+- 复制线格式: 控制行 `SNAPSHOT <snapshot_offset> <count>` / `BATCH <offset> <count>`,effect 帧 `E <len>\r\n<RESP array payload>\r\n`(长度前缀,可承载二进制)。
+
 ## Risks / Trade-offs
 
 - [异步复制丢数据] master 推送前崩溃会丢最后几条写 → 文档化为已知取舍;需强一致时可后续加同步复制选项。
