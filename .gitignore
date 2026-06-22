@@ -1,28 +1,12 @@
-# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
-.eggs/
-build/
-dist/
-
-# Virtual env
+.pytest_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
 env/
-
-# Test / coverage
-.pytest_cache/
-.coverage
-coverage.xml
-htmlcov/
-
-# Editor / tooling
-.cursor/
-.idea/
-.vscode/
-*.swp
-
-# OS
 .DS_Store
-Thumbs.db
+*.log
+.cursor/
