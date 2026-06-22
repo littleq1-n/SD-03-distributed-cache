@@ -1,0 +1,59 @@
+# consistent-hashing Specification
+
+## Purpose
+TBD - created by archiving change add-distributed-cache. Update Purpose after archive.
+## Requirements
+### Requirement: 带虚拟节点的一致性哈希环
+
+系统 SHALL 实现一致性哈希环,每个物理节点 MUST 在环上映射为可配置数量的虚拟节点,以使 key 在节点间分布大致均匀。给定一个 key,系统 MUST 将其映射到环上顺时针方向遇到的第一个虚拟节点所属的物理节点。
+
+#### Scenario: key 路由到确定节点
+
+- **GIVEN** 一个含固定节点集合的哈希环
+- **WHEN** 对同一个 key 多次计算其归属节点
+- **THEN** 每次都返回同一个物理节点
+
+#### Scenario: 分布大致均匀
+
+- **GIVEN** 一个含若干物理节点(每节点多个虚拟节点)的哈希环
+- **WHEN** 将大量随机 key 映射到环上
+- **THEN** 各物理节点承载的 key 数量大致均衡,无单节点严重倾斜
+
+#### Scenario: 空环查询(异常/边界)
+
+- **GIVEN** 一个未添加任何节点的空哈希环
+- **WHEN** 查询任意 key 的归属节点
+- **THEN** 返回空(无可用节点),而非抛出未处理异常
+
+### Requirement: 客户端侧路由
+
+系统 SHALL 提供客户端,客户端 MUST 基于本地维护的一致性哈希环自行计算 key 的归属节点,并直接与该节点建立连接发送命令。
+
+#### Scenario: 客户端直连归属节点
+
+- **GIVEN** 客户端本地维护着节点环
+- **WHEN** 客户端执行 `set(key, value)`
+- **THEN** 客户端用哈希环算出归属节点,并将命令发送到该节点而非随机节点
+
+#### Scenario: 无节点时报错(异常)
+
+- **GIVEN** 客户端环中没有任何节点
+- **WHEN** 客户端执行读写
+- **THEN** 返回明确错误(无可用节点),而非静默失败
+
+### Requirement: 增删节点的 transient-miss 语义
+
+增删物理节点后,系统 MUST 仅使受影响的约 1/N 比例的 key 改变归属;系统 MUST NOT 实现数据迁移。受影响 key 在新归属节点上表现为缓存 miss,由调用方回源重建;旧节点上的孤儿副本由 LRU/TTL 自然老化。
+
+#### Scenario: 新增节点只影响约 1/N 的 key
+
+- **GIVEN** 一个含 N 个节点的哈希环及一批已分配的 key
+- **WHEN** 向环中新增 1 个节点
+- **THEN** 仅约 1/(N+1) 的 key 归属发生改变,其余 key 归属不变
+
+#### Scenario: 受影响 key 表现为 miss 而非数据丢失(异常路径)
+
+- **GIVEN** 某 key 因增删节点改变了归属
+- **WHEN** 客户端访问其新归属节点
+- **THEN** 在新节点上返回 miss(供回源),而非报错或返回错误数据
+
