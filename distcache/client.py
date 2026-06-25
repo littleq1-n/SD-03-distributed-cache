@@ -5,6 +5,7 @@
 """
 
 import socket
+import threading
 from typing import List, Optional, Tuple
 
 from . import protocol
@@ -89,20 +90,52 @@ class _Conn:
 
 
 class DistributedCacheClient:
-    """多节点分片客户端:基于一致性哈希做客户端侧路由。"""
+    """多节点分片客户端:基于一致性哈希做客户端侧路由。
 
-    def __init__(self, nodes: List[Tuple[str, int]], vnodes: int = 150):
-        self._addr = {"%s:%d" % (h, p): (h, p) for (h, p) in nodes}
-        self.ring = ConsistentHashRing(list(self._addr.keys()), vnodes=vnodes)
-        self._conns = {}
+    可选 etcd 服务发现:传入 ``etcd_endpoints`` 时,客户端自动从 etcd 拉取节点
+    列表并 watch 前缀变更;`add_node`/`remove_node` 由 watcher 后台线程回调。
+    """
+
+    def __init__(self,
+                 nodes: Optional[List[Tuple[str, int]]] = None,
+                 vnodes: int = 150,
+                 etcd_endpoints: Optional[List[str]] = None,
+                 etcd_prefix: str = "/distcache/nodes/"):
+        self._addr_lock = threading.Lock()
+        self._addr: dict = {}
+        self.ring = ConsistentHashRing([], vnodes=vnodes)
+        self._conns: dict = {}
+        self._watcher = None
+
+        if etcd_endpoints:
+            from . import discovery  # 局部 import:核心模块不强依赖 etcd3
+            self._watcher = discovery.EtcdWatcher(etcd_endpoints, prefix=etcd_prefix)
+            for host, port in self._watcher.list_nodes():
+                self._add_node_locked(host, port)
+            self._watcher.watch(on_add=self.add_node, on_remove=self.remove_node)
+        elif nodes:
+            for (h, p) in nodes:
+                self._add_node_locked(h, p)
+
+    def _add_node_locked(self, host: str, port: int) -> None:
+        node = "%s:%d" % (host, port)
+        with self._addr_lock:
+            if node in self._addr:
+                return
+            self._addr[node] = (host, port)
+        self.ring.add_node(node)
 
     def _conn_for(self, key) -> Tuple[_Conn, str]:
         node = self.ring.get_node(key)
         if node is None:
             raise CacheError("no nodes in ring")
+        with self._addr_lock:
+            addr = self._addr.get(node)
+        if addr is None:
+            raise CacheError("node %s no longer registered" % node)
         conn = self._conns.get(node)
         if conn is None:
-            h, p = self._addr[node]
+            h, p = addr
             conn = _Conn(h, p)
             self._conns[node] = conn
         return conn, node
@@ -112,14 +145,13 @@ class DistributedCacheClient:
         return self.ring.get_node(key)
 
     def add_node(self, host: str, port: int) -> None:
-        node = "%s:%d" % (host, port)
-        self._addr[node] = (host, port)
-        self.ring.add_node(node)
+        self._add_node_locked(host, port)
 
     def remove_node(self, host: str, port: int) -> None:
         node = "%s:%d" % (host, port)
         self.ring.remove_node(node)
-        self._addr.pop(node, None)
+        with self._addr_lock:
+            self._addr.pop(node, None)
         conn = self._conns.pop(node, None)
         if conn is not None:
             conn.close()
@@ -140,3 +172,9 @@ class DistributedCacheClient:
         for conn in self._conns.values():
             conn.close()
         self._conns.clear()
+        if self._watcher is not None:
+            try:
+                self._watcher.stop()
+            except Exception:
+                pass
+            self._watcher = None

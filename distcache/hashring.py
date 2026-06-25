@@ -7,10 +7,18 @@
 
 import bisect
 import hashlib
+import threading
 from typing import Iterable, Optional, Set
 
 
 class ConsistentHashRing:
+    """带虚拟节点的一致性哈希环。
+
+    线程安全:所有 mutator(``add_node``/``remove_node``)与 reader(``get_node``/
+    ``nodes``)均通过 ``self._lock`` 串行化,使 EtcdWatcher 后台线程触发的
+    增删与主线程的读路由可以安全并发。
+    """
+
     def __init__(self, nodes: Optional[Iterable[str]] = None, vnodes: int = 150):
         if vnodes <= 0:
             raise ValueError("vnodes must be > 0")
@@ -18,6 +26,7 @@ class ConsistentHashRing:
         self._ring = {}          # vnode_hash -> 物理节点
         self._sorted = []        # 排序后的 vnode_hash 列表(用于二分)
         self._nodes: Set[str] = set()
+        self._lock = threading.Lock()
         if nodes:
             for n in nodes:
                 self.add_node(n)
@@ -30,35 +39,39 @@ class ConsistentHashRing:
         return int.from_bytes(hashlib.md5(key).digest()[:8], "big")
 
     def add_node(self, node: str) -> None:
-        if node in self._nodes:
-            return
-        self._nodes.add(node)
-        for i in range(self.vnodes):
-            h = self._hash("%s#%d" % (node, i))
-            self._ring[h] = node
-            bisect.insort(self._sorted, h)
+        with self._lock:
+            if node in self._nodes:
+                return
+            self._nodes.add(node)
+            for i in range(self.vnodes):
+                h = self._hash("%s#%d" % (node, i))
+                self._ring[h] = node
+                bisect.insort(self._sorted, h)
 
     def remove_node(self, node: str) -> None:
-        if node not in self._nodes:
-            return
-        self._nodes.discard(node)
-        for i in range(self.vnodes):
-            h = self._hash("%s#%d" % (node, i))
-            if h in self._ring:
-                del self._ring[h]
-                idx = bisect.bisect_left(self._sorted, h)
-                if idx < len(self._sorted) and self._sorted[idx] == h:
-                    self._sorted.pop(idx)
+        with self._lock:
+            if node not in self._nodes:
+                return
+            self._nodes.discard(node)
+            for i in range(self.vnodes):
+                h = self._hash("%s#%d" % (node, i))
+                if h in self._ring:
+                    del self._ring[h]
+                    idx = bisect.bisect_left(self._sorted, h)
+                    if idx < len(self._sorted) and self._sorted[idx] == h:
+                        self._sorted.pop(idx)
 
     def get_node(self, key) -> Optional[str]:
-        if not self._sorted:
-            return None
-        h = self._hash(key)
-        idx = bisect.bisect(self._sorted, h)
-        if idx == len(self._sorted):
-            idx = 0  # 环形回绕
-        return self._ring[self._sorted[idx]]
+        with self._lock:
+            if not self._sorted:
+                return None
+            h = self._hash(key)
+            idx = bisect.bisect(self._sorted, h)
+            if idx == len(self._sorted):
+                idx = 0  # 环形回绕
+            return self._ring[self._sorted[idx]]
 
     @property
     def nodes(self) -> Set[str]:
-        return set(self._nodes)
+        with self._lock:
+            return set(self._nodes)
