@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: distcache
+    static_configs:
+      - targets:
+          # 主集群:3 个分片(默认演示拓扑)
+          - host.docker.internal:9101
+          - host.docker.internal:9102
+          - host.docker.internal:9103
+          # 主从演示拓扑(scripts/demo_replication.py 使用)
+          - host.docker.internal:9201
+          - host.docker.internal:9202
+        labels:
+          cluster: dev
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

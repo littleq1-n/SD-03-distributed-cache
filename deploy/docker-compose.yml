@@ -1,0 +1,62 @@
+# distcache 可观测性 + 服务发现栈
+#
+# 启动:  cd deploy && docker compose up -d
+# 停止:  docker compose down
+# 访问:
+#   - etcd:        127.0.0.1:2379
+#   - Prometheus:  http://localhost:9090
+#   - Grafana:     http://localhost:3000  (admin / admin)
+#
+# 注意:Python 节点跑在宿主机上(不在容器里),Prometheus 通过
+# host.docker.internal 抓取宿主机的 9101/9102/9103 端口。
+# Linux 上通过下方 extra_hosts 把 host.docker.internal 显式映射到
+# 宿主网关(macOS/Windows 上 Docker Desktop 已自带,extra_hosts 无副作用)。
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: distcache-etcd
+    command:
+      - etcd
+      - --name=etcd0
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --initial-advertise-peer-urls=http://0.0.0.0:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-cluster=etcd0=http://0.0.0.0:2380
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: distcache-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: distcache-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
