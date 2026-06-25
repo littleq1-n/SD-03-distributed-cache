@@ -1,3 +1,12 @@
-# 运行时:仅标准库,无第三方依赖
+# 运行时:仅标准库,无强制第三方依赖
+#
+# 可选(未安装时自动降级,核心功能不受影响):
+#   prometheus_client>=0.20    # /metrics 暴露;未装则节点不开 metrics 端口,埋点全部 no-op
+#   etcd3>=0.12                # 服务发现;未传 --etcd / etcd_endpoints 时不会被 import
+#   protobuf>=3.20,<4          # etcd3 与 protobuf 5.x 不兼容,必须 <4
+prometheus_client>=0.20 ; python_version >= "3.9"
+etcd3>=0.12 ; python_version >= "3.9"
+protobuf>=3.20,<4 ; python_version >= "3.9"
+
 # 测试依赖:
 pytest>=7.0

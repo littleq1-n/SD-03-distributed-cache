@@ -133,6 +133,10 @@ class ReplicaClient:
         self.store = store
         self.reconnect_delay = reconnect_delay
         self.applied_offset = 0
+        # 已从 master 接收到的最大 batch offset(可能 > applied_offset:
+        # 读到 BATCH 头时即更新,完整应用整个 batch 后 applied_offset 才推进)。
+        # 在 slave 侧用作 replication lag = last_seen_offset - applied_offset 的来源。
+        self.last_seen_offset = 0
         self._stop = False
         self._task = None
         self.synced_event = asyncio.Event()
@@ -205,10 +209,14 @@ class ReplicaClient:
                     items.append((key, value, expire_at))
                 self.store.load_snapshot(items)
                 self.applied_offset = snap_off
+                if snap_off > self.last_seen_offset:
+                    self.last_seen_offset = snap_off
                 self.synced_event.set()
             elif tag == b"BATCH":
                 off = int(parts[1])
                 n = int(parts[2])
+                if off > self.last_seen_offset:
+                    self.last_seen_offset = off
                 # 先读齐整个 batch 的所有 effect,再原子应用、最后推进 offset
                 effects = [await self._read_effect(reader) for _ in range(n)]
                 for eff in effects:

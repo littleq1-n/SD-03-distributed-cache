@@ -11,7 +11,7 @@
 import asyncio
 import time
 
-from . import protocol
+from . import metrics, protocol
 from .lru import LRUCache
 from .replication import MasterReplicator, ReplicaClient
 
@@ -27,11 +27,13 @@ def _b(x) -> bytes:
 class Node:
     def __init__(self, host: str = "127.0.0.1", port: int = 7001,
                  maxsize: int = 1024, role: str = "master",
-                 time_func=time.time, expire_interval: float = 1.0):
+                 time_func=time.time, expire_interval: float = 1.0,
+                 metrics_sample_interval: float = 1.0):
         self.host = host
         self.port = port
         self.time = time_func
         self.expire_interval = expire_interval
+        self.metrics_sample_interval = metrics_sample_interval
         self.role = role
         mode = LRUCache.AUTHORITATIVE if role == "master" else LRUCache.LOGICAL
         self.store = LRUCache(maxsize=maxsize, mode=mode, time_func=time_func)
@@ -39,6 +41,9 @@ class Node:
         self.replica_client = None
         self._server = None
         self._expire_task = None
+        self._metrics_task = None
+        metrics.cache_maxsize.set(maxsize)
+        metrics.role_gauge.set(1 if self.is_master else 0)
 
     @property
     def is_master(self) -> bool:
@@ -57,6 +62,7 @@ class Node:
             self._expire_task = asyncio.ensure_future(self._active_expire_loop())
         if self.replica_client is not None:
             self.replica_client.start()
+        self._metrics_task = asyncio.ensure_future(self._metrics_sample_loop())
         return self._server
 
     async def stop(self):
@@ -67,6 +73,13 @@ class Node:
             except asyncio.CancelledError:
                 pass
             self._expire_task = None
+        if self._metrics_task is not None:
+            self._metrics_task.cancel()
+            try:
+                await self._metrics_task
+            except asyncio.CancelledError:
+                pass
+            self._metrics_task = None
         if self.replica_client is not None:
             await self.replica_client.stop()
         if self._server is not None:
@@ -82,6 +95,7 @@ class Node:
             self.replica_client = None
         if self._expire_task is None:
             self._expire_task = asyncio.ensure_future(self._active_expire_loop())
+        metrics.role_gauge.set(1)
 
     async def _active_expire_loop(self):
         """authoritative 主动采样过期清理;删除作为 DEL 进入复制流。"""
@@ -91,6 +105,29 @@ class Node:
                 removed = self.store.sample_expired(now=self.time())
                 for k in removed:
                     self.replicator.append_batch([("DEL", _b(k))])
+        except asyncio.CancelledError:
+            pass
+
+    async def _metrics_sample_loop(self):
+        """周期采样:size / role / replication offset & lag。"""
+        try:
+            while True:
+                await asyncio.sleep(self.metrics_sample_interval)
+                metrics.cache_size.set(len(self.store))
+                metrics.role_gauge.set(1 if self.is_master else 0)
+                if self.is_master:
+                    metrics.repl_offset.labels(role="master").set(
+                        self.replicator.offset)
+                    metrics.repl_lag.set(0)
+                else:
+                    if self.replica_client is not None:
+                        applied = self.replica_client.applied_offset
+                        seen = self.replica_client.last_seen_offset
+                    else:
+                        applied = 0
+                        seen = 0
+                    metrics.repl_offset.labels(role="slave").set(applied)
+                    metrics.repl_lag.set(max(seen - applied, 0))
         except asyncio.CancelledError:
             pass
 
@@ -130,7 +167,45 @@ class Node:
                 pass
 
     def _dispatch(self, args) -> bytes:
-        """同步分发。对写命令,本地应用与 effect 入队在此连续完成、中间无 await。"""
+        """同步分发(带 metrics 埋点外层)。
+
+        对写命令,本地应用与 effect 入队在 ``_dispatch_inner`` 中连续完成、中间无 await。
+        本外层只做延迟测量和 ops_total 分类计数,**不引入新的 await/IO**,
+        因此对临界区契约无影响。
+        """
+        cmd_label = self._cmd_label(args)
+        with metrics.op_latency.labels(cmd=cmd_label).time():
+            resp = self._dispatch_inner(args)
+        result_label = self._classify_result(resp)
+        metrics.ops_total.labels(cmd=cmd_label, result=result_label).inc()
+        return resp
+
+    @staticmethod
+    def _cmd_label(args) -> str:
+        if not args:
+            return "UNKNOWN"
+        try:
+            return args[0].upper().decode("ascii", errors="replace")
+        except Exception:
+            return "UNKNOWN"
+
+    @staticmethod
+    def _classify_result(resp: bytes) -> str:
+        if not resp:
+            return "error"
+        first = resp[:1]
+        if first == b"+":
+            return "ok"
+        if first == b"-":
+            # 区分 readonly 与其他错误,便于面板按 result 分类
+            if resp.startswith(b"-ERR READONLY"):
+                return "readonly"
+            return "error"
+        if first == b"$":
+            return "miss" if resp.startswith(b"$-1") else "hit"
+        return "ok"
+
+    def _dispatch_inner(self, args) -> bytes:
         cmd = args[0].upper()
         if cmd == b"GET":
             if len(args) != 2:
@@ -175,6 +250,7 @@ class Node:
         effects = [("SET", key, value, ms)]
         if evicted is not None:
             effects.append(("DEL", _b(evicted)))
+            metrics.evictions_total.inc()
         self.replicator.append_batch(effects)
         # --- 临界区结束 ---
         return protocol.encode_simple("OK")
@@ -195,6 +271,7 @@ class Node:
         effects = [("SET", key, value, ms)]
         if evicted is not None:
             effects.append(("DEL", _b(evicted)))
+            metrics.evictions_total.inc()
         self.replicator.append_batch(effects)
         return protocol.encode_simple("OK")
 
