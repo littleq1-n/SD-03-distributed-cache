@@ -88,7 +88,8 @@
     },
     {
       "id": 4,
-      "title": "复制 offsets(两线越分开 = lag 越大)",
+      "title": "复制 offsets (master vs slave)",
+      "description": "master.offset: master 已应用的 batch 数;slave.applied: slave 已回放的 batch 数。两线重合表示 slave 已追上;纵向间距表示复制 lag。",
       "type": "timeseries",
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
       "datasource": {"type": "prometheus", "uid": "prometheus"},
@@ -105,13 +106,13 @@
       },
       "targets": [
         {
-          "expr": "distcache_replication_offset{role=\"master\"}",
-          "legendFormat": "master.offset {{instance}}",
+          "expr": "distcache_replication_offset{role=\"master\", instance=\"host.docker.internal:9101\"}",
+          "legendFormat": "master.offset (9101)",
           "refId": "A"
         },
         {
-          "expr": "distcache_replication_offset{role=\"slave\"}",
-          "legendFormat": "slave.applied {{instance}}",
+          "expr": "distcache_replication_offset{role=\"slave\", instance=\"host.docker.internal:9102\"}",
+          "legendFormat": "slave.applied (9102)",
           "refId": "B"
         }
       ]

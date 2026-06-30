@@ -161,7 +161,8 @@ python3 scripts/load.py --duration 90 \
 |---|---|
 | `scripts/load.py` | 可调命中率 / QPS 的负载生成器,给 Grafana 制造活跃曲线 |
 | `scripts/watch_ring.py` | 实时观察客户端哈希环成员变化,演示 etcd 服务发现 |
-| `scripts/demo_replication.py` | 一键起 master+slave 子进程,展示复制 offset 分叉与追平 |
+| `scripts/demo_replication.py` | 一键起 master+slave 子进程,终端逐秒打印 master / slave offset,展示复制 lag 形成与追平 |
+| `scripts/repro_v2_7_stable.sh` | **一键重现 Grafana 主图**(`docs/pic/v2_9.png`):清场 → 起栈 → 起 master/slave → 跑 30s 预热 + 90s 满载 → 提示截图 → trap 自动清理 |
 
 **完整截图剧本** 详见 [`docs/doc/demo-playbook.md`](docs/doc/demo-playbook.md)。
 
@@ -196,16 +197,27 @@ python3 scripts/load.py --duration 90 \
 
 ### v2 新增能力 ② — Grafana 可观测性仪表盘
 
-按上面 §4 步骤跑一次预热 30s + 主负载 90s,Grafana 仪表盘四面板实时反映系统状态:
+跑 `bash scripts/repro_v2_7_stable.sh`(30s 预热 + 90s 满载),Grafana 仪表盘四面板实时反映系统状态:
 
-![Grafana 仪表盘:负载下的四面板](docs/pic/v2_6.png)
+![Grafana 仪表盘:负载下的四面板](docs/pic/v2_9.png)
+
+> **一句话读图**:GET/SET 4:1 比例符合负载配方,命中率稳定在理论值 75%,P99 微秒级,master/slave offset 同步上涨且重合 = slave 已追上。
 
 时间窗 *Last 5 minutes*、刷新 *5s*。各面板:
 
-- **左上 QPS by cmd**:GET / SET 各自的速率。可见单段斜坡上升,GET 约 10K ops/s、SET 约 2.5K ops/s,符合 load.py 的 6:2 命中比例。
+- **左上 QPS by cmd**:GET 绿线 ~1K ops/s、SET 黄线 ~400 ops/s,4:1 符合 load.py 的 `hit 0.6 / miss 0.2 / set 0.2` 配方。
 - **右上 GET 命中率**(集群整体):稳定在 **~0.75**(理论值 `0.6 / (0.6 + 0.2) = 75%`)。图例 `hit ratio (cluster)` 表示这是用 `sum()` 聚合掉 `result` 标签后的全集群命中率。
-- **左下 P99 延迟 by cmd**:histogram quantile 派生的 GET / SET P99;本机部署延迟落入最小 bucket (~99µs),曲线接近平直,跨网络部署会拉开差距。
-- **右下 复制 offsets**:每个节点的 `distcache_replication_offset{role}`,三条 master.offset 曲线 (9101 / 9102 / 9103) **从 0 同步起涨**;若挂上 slave,master / slave 两条线分开的距离即复制 lag。
+- **左下 P99 延迟 by cmd**:histogram quantile 派生的 GET / SET P99。GET 稳在 ~10µs;SET 从 ~25µs 收敛到 ~19µs,这是 `histogram_quantile` 在样本量增大后估算更精准的正常现象,**不是延迟在退化**。
+- **右下 复制 offsets (master vs slave)**:`distcache_replication_offset{role}` 指标。master.offset (9101) 与 slave.applied (9102) **同步上涨且基本重合**,说明 slave 已追上;若 slave 卡顿,黄线会低于绿线,纵向间距即物理 lag。本机 RTT ≈ 0,两线在 Grafana 5s 抓样精度下重合是正常的健康表现,**逐秒 lag 证据见下面 ③**。
+
+### v2 新增能力 ③ — 复制 lag 的逐秒证据(终端时序图)
+
+Grafana 5s 抓样的精度对本机异步复制太粗。`scripts/demo_replication.py` 起一对独立进程的 master+slave,每秒 curl `/metrics` 端口并打印 `master.offset / slave.applied / lag`,直接展示 lag 的形成与归零:
+
+![复制 lag 时序:阶段 1 同步 → 阶段 2 分叉 → 阶段 3 追平](docs/pic/v2_8.png)
+
+> **一句话读图**:阶段 1 慢速写,master/slave 完全同步;阶段 2 高速灌 20w 条,中间多次出现 6K~16K 的 offset 差值(物理 lag);阶段 3 停写后 1 秒内追平到 201000,体现"会有 lag、最终一致"。
+
 
 ---
 
@@ -297,17 +309,5 @@ python3 -m pytest -q tests/test_discovery.py    # 9 passed (无 etcd 时 7 passe
 ```
 
 `test_metrics.py` 同时验证两条路径:**no-op 兼容性**(无 `prometheus_client` 时埋点不抛异常)和 **真启用路径**(在 `REGISTRY` 里能读到正确的 Counter / Gauge 值)。
-
----
-
-## 实操经验(踩过的坑 → 配套防御)
-
-| 现象 | 原因 | 已做的防御 |
-|---|---|---|
-| 节点用 `&` 启动,关闭终端就消失 | `&` 后台进程跟随 shell 收到 SIGHUP | README 示例统一用 `nohup ... & disown`(见 §4 第 2 步) |
-| 删卷重建后 Grafana 面板全 No data | 自动生成的 datasource UID 与 dashboard 写死的 UID 不匹配 | `deploy/grafana/provisioning/datasources/ds.yml` 固定 `uid: prometheus` |
-| GET 命中率永远 100% | 查询表达式分子 / 分母 `result` 标签没聚合掉,变成 `hit/hit` | `dashboard.json` 改为 `sum(...)` 包裹分子分母 |
-| `load.py` 退出末尾 `Aborted (core dumped)` | etcd3 v0.12 守护线程与 Python 3.11 finalize 阶段竞态 | `scripts/load.py` 装 `threading.excepthook` 过滤 etcd3 噪音 + `os._exit(0)` 跳过 finalize |
-| Prometheus target 显示 down,但节点其实 OK | 节点启动后立即查,scrape 还没发生 | 查询前 `sleep 10`(scrape_interval 5s) |
 
 ---
